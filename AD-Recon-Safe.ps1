@@ -49,89 +49,107 @@ $btn.Add_Click({
     # Iniciar job en background
     $job = Start-Job -ArgumentList $dir -ScriptBlock {
         param($outDir)
-        
+
+        # Force TLS 1.2 for GitHub API
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+        $sharpHoundSuccess = $false
+
         # SharpHound download and execution
         try {
             Write-Output "Descargando SharpHound …"
             $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/BloodHoundAD/SharpHound/releases/latest" -TimeoutSec 15 -ErrorAction Stop
             $asset = $rel.assets | Where-Object { $_.name -like "*SharpHound.exe" } | Select-Object -First 1
             $url = $asset.browser_download_url
-            
-            if (-not $url) { 
-                Write-Output "No se encontró SharpHound.exe en la release" 
+
+            if (-not $url) {
+                Write-Output "No se encontró SharpHound.exe en la release."
             } else {
                 $exe = Join-Path $outDir "SharpHound.exe"
                 Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing -ErrorAction Stop
                 Write-Output "✅ SharpHound descargado: $exe"
                 Write-Output "Lanzando SharpHound …"
-                
+
                 $p = Start-Process -FilePath $exe -WorkingDirectory $outDir -ArgumentList "-c","All","--ZipFileName","SharpOut" -NoNewWindow -PassThru -Wait
-                
+
                 if ($p.ExitCode -eq 0 -and (Test-Path (Join-Path $outDir "SharpOut.zip"))) {
-                    Write-Output "✅ SharpHound finalizó correctamente"
+                    Write-Output "✅ SharpHound finalizó correctamente."
+                    $sharpHoundSuccess = $true
                 } else {
-                    Write-Output "⚠️ SharpHound finalizó con ExitCode $($p.ExitCode)"
+                    Write-Output "⚠️ SharpHound finalizó con ExitCode $($p.ExitCode)."
                 }
             }
         } catch {
-            Write-Output "⚠️  Fallo SharpHound: $($_.Exception.Message)"
+            Write-Output "⚠️ Fallo en la fase de SharpHound: $($_.Exception.Message)"
         }
 
-        # Fallback LDAP simple
-        try {
-            Write-Output "Recuperando objetos básicos por LDAP …"
-            $dom  = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
-            $root = $dom.GetDirectoryEntry()
-            $src  = New-Object System.DirectoryServices.DirectorySearcher($root)
+        # Fallback LDAP simple (RSAT-less)
+        if (-not $sharpHoundSuccess) {
+            try {
+                Write-Output "SharpHound falló. Intentando recolección LDAP simple..."
 
-            $src.Filter = "(objectCategory=user)"
-            $users = $src.FindAll()
-            $userList = @()
-            foreach ($u in $users) {
-                $val = $u.Properties["samaccountname"]
-                if ($val -and $val.Count -gt 0) { $userList += $val[0] }
+                # Find the default naming context without RSAT
+                $rootDSE = New-Object System.DirectoryServices.DirectoryEntry("LDAP://rootDSE")
+                $defaultNamingContext = $rootDSE.Properties["defaultNamingContext"].Value
+                if (-not $defaultNamingContext) {
+                    throw "No se pudo obtener el contexto de nombres predeterminado del dominio."
+                }
+                $root = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$defaultNamingContext")
+
+                $src  = New-Object System.DirectoryServices.DirectorySearcher($root)
+                $src.PageSize = 1000
+
+                # Get Users
+                Write-Output "Obteniendo usuarios..."
+                $src.Filter = "(&(objectCategory=person)(objectClass=user))"
+                $users = $src.FindAll()
+                $userList = foreach ($u in $users) {
+                    $u.Properties["samaccountname"][0]
+                }
+                $userList | Set-Content (Join-Path $outDir "LDAP_Users.txt")
+                if ($users) { $users.Dispose() }
+
+                # Get Computers
+                Write-Output "Obteniendo equipos..."
+                $src.Filter = "(objectCategory=computer)"
+                $computers = $src.FindAll()
+                $compList = foreach ($c in $computers) {
+                    $c.Properties["name"][0]
+                }
+                $compList | Set-Content (Join-Path $outDir "LDAP_Computers.txt")
+                if ($computers) { $computers.Dispose() }
+
+                # Get Groups
+                Write-Output "Obteniendo grupos..."
+                $src.Filter = "(objectCategory=group)"
+                $groups = $src.FindAll()
+                $groupList = foreach ($g in $groups) {
+                    $g.Properties["samaccountname"][0]
+                }
+                $groupList | Set-Content (Join-Path $outDir "LDAP_Groups.txt")
+                if ($groups) { $groups.Dispose() }
+
+                if ($src) { $src.Dispose() }
+                if ($root) { $root.Dispose() }
+                if ($rootDSE) { $rootDSE.Dispose() }
+
+                Write-Output "✅ Datos LDAP simples exportados."
+            } catch {
+                Write-Output "❌ Error en recolección LDAP simple: $($_.Exception.Message)"
             }
-            $userList | Set-Content (Join-Path $outDir "LDAP_Users.txt")
-            $users.Dispose()
-
-            $src.Filter = "(objectCategory=computer)"
-            $computers = $src.FindAll()
-            $compList = @()
-            foreach ($c in $computers) {
-                $val = $c.Properties["name"]
-                if ($val -and $val.Count -gt 0) { $compList += $val[0] }
-            }
-            $compList | Set-Content (Join-Path $outDir "LDAP_Computers.txt")
-            $computers.Dispose()
-
-            $src.Filter = "(objectCategory=group)"
-            $groups = $src.FindAll()
-            $groupList = @()
-            foreach ($g in $groups) {
-                $val = $g.Properties["samaccountname"]
-                if ($val -and $val.Count -gt 0) { $groupList += $val[0] }
-            }
-            $groupList | Set-Content (Join-Path $outDir "LDAP_Groups.txt")
-            $groups.Dispose()
-
-            $src.Dispose()
-            $root.Dispose()
-            Write-Output "✅ Datos simples exportados"
-        } catch {
-            Write-Output "❌ Error LDAP simple: $($_.Exception.Message)"
         }
-        
+
         Write-Output "PROCESO_COMPLETADO"
     }
 
     # Variables para el timer
     $script:currentJob = $job
     $script:jobCompleted = $false
-    
+
     # Timer para monitorear el job
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 500
-    
+
     $timer.Add_Tick({
         try {
             # Verificar si el job aún existe
@@ -140,7 +158,7 @@ $btn.Add_Click({
                 $btn.Enabled = $true
                 return
             }
-            
+
             # Intentar obtener el job de forma segura
             $jobState = $null
             try {
@@ -155,7 +173,7 @@ $btn.Add_Click({
                 [System.Windows.Forms.MessageBox]::Show("Recolecta finalizada.", "Hecho", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
                 return
             }
-            
+
             # Leer salida disponible
             try {
                 $output = Receive-Job -Id $script:currentJob.Id -ErrorAction SilentlyContinue
@@ -170,7 +188,7 @@ $btn.Add_Click({
             } catch {
                 Write-Log "Error leyendo salida: $($_.Exception.Message)"
             }
-            
+
             # Verificar si el job terminó
             if ($jobState -ne 'Running') {
                 try {
@@ -181,23 +199,23 @@ $btn.Add_Click({
                             Write-Log $line
                         }
                     }
-                    
+
                     # Limpiar job
                     Remove-Job -Id $script:currentJob.Id -Force -ErrorAction SilentlyContinue
                 } catch {}
-                
+
                 $script:currentJob = $null
                 $this.Stop()
                 $this.Dispose()
                 $btn.Enabled = $true
-                
+
                 if ($script:jobCompleted) {
                     [System.Windows.Forms.MessageBox]::Show("Recolecta finalizada. Revisa los archivos en la carpeta seleccionada.", "Hecho", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
                 } else {
                     [System.Windows.Forms.MessageBox]::Show("Proceso terminado. Revisa el log para más detalles.", "Aviso", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
                 }
             }
-            
+
         } catch {
             Write-Log "Error en timer: $($_.Exception.Message)"
             $this.Stop()
@@ -205,7 +223,7 @@ $btn.Add_Click({
             $script:currentJob = $null
         }
     })
-    
+
     $timer.Start()
 })
 
